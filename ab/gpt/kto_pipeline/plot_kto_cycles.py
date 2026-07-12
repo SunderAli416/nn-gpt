@@ -174,88 +174,6 @@ def load_per_model_accuracies(cycles_dir: Optional[Path]) -> Dict[int, List[floa
     return accs
 
 
-def _load_structural_hasher():
-    """Import the pipeline's StructuralHasher so post-hoc novelty matches the
-    pipeline's own structural-hash definition. Falls back to adding the repo root
-    to sys.path (so this script works standalone, without PYTHONPATH=/project)."""
-    try:
-        from ab.gpt.iterative_pipeline.novelty_checker import StructuralHasher
-        return StructuralHasher
-    except Exception:  # noqa: BLE001
-        import sys
-        repo_root = Path(__file__).resolve().parents[3]  # <repo>/ab/gpt/kto_pipeline/ -> <repo>
-        sys.path.insert(0, str(repo_root))
-        try:
-            from ab.gpt.iterative_pipeline.novelty_checker import StructuralHasher
-            return StructuralHasher
-        except Exception as e:  # noqa: BLE001
-            print(f"[plot][warn] structural novelty unavailable ({e}); "
-                  "novelty chart falls back to stored bucketing counts")
-            return None
-
-
-def compute_generation_novelty(cycles_dir: Optional[Path]) -> Dict[int, Dict[str, float]]:
-    """Per-cycle structural novelty over EVERY extractable generation, reconstructed
-    from the generated code files. This is identical across run types: it does not
-    depend on eval-skip, the accuracy threshold, or the similarity penalty (unlike
-    the stored not_novel/new_desirable counts, whose meaning differs per run). A
-    generation is 'novel' if its structural hash was not produced in any earlier
-    cycle (and is the first occurrence within its own cycle). Reads both new_nn.py
-    and new_nn.notnovel.py so pre-filtered duplicates still count in the denominator.
-
-    Returns {cycle: {"total", "novel", "rate"}}; empty if unavailable.
-    """
-    out: Dict[int, Dict[str, float]] = {}
-    if not cycles_dir or not cycles_dir.exists():
-        return out
-    Hasher = _load_structural_hasher()
-    if Hasher is None:
-        return out
-    hasher = Hasher()
-
-    def _hash(code: str) -> Optional[str]:
-        sig = hasher.extract_from_code(code)
-        if "error" in sig:
-            return None  # unparseable → not a valid architecture
-        return hasher.compute_hash(sig)
-
-    def _cycle_num(d: Path) -> int:
-        try:
-            return int(d.name.split("_")[1])
-        except (IndexError, ValueError):
-            return -1
-
-    seen: set = set()  # structural hashes of all distinct generations from earlier cycles
-    for cycle_dir in sorted((d for d in cycles_dir.glob("cycle_*") if _cycle_num(d) >= 0),
-                            key=_cycle_num):
-        n = _cycle_num(cycle_dir)
-        nneval = cycle_dir / "nneval"
-        if not nneval.exists():
-            continue
-        total = novel = 0
-        this_cycle: set = set()
-        for md in sorted(p for p in nneval.iterdir() if p.is_dir()):
-            code_file = md / "new_nn.py"
-            if not code_file.exists():
-                code_file = md / "new_nn.notnovel.py"  # pre-filtered duplicate (self-contained)
-            if not code_file.exists():
-                continue
-            try:
-                h = _hash(code_file.read_text(encoding="utf-8", errors="replace"))
-            except Exception:  # noqa: BLE001
-                h = None
-            if h is None:
-                continue
-            total += 1
-            if h not in seen and h not in this_cycle:
-                novel += 1
-            this_cycle.add(h)
-        if total:
-            out[n] = {"total": total, "novel": novel, "rate": 100.0 * novel / total}
-            seen |= this_cycle
-    return out
-
-
 def apply_pass_average(cycles: List[Dict[str, Any]], per_model: Dict[int, List[float]],
                        run_threshold: float) -> None:
     """Redefine 'avg' as the mean over models that cleared the threshold (card-style).
@@ -376,39 +294,23 @@ def plot_separate(cycles: List[Dict[str, Any]], out_dir: Path,
     fig.tight_layout(); fig.savefig(bpath, dpi=130); plt.close(fig)
     paths.append(bpath)
 
-    # ── Novelty per cycle: novel vs duplicate architectures GENERATED ──
-    # Preferred source is the reconstructed structural novelty over EVERY generation
-    # (gen_total/gen_novel), which is comparable across run types — self-contained
-    # pre-filters non-novel models out of evaluation while sim-penalty evaluates all,
-    # so the stored counts are not comparable but this reconstruction is. Falls back
-    # to the stored bucketing counts (novel/duplicate among threshold-clearing models)
-    # when the code files / structural hasher aren't available.
-    reconstructed = any("gen_total" in r for r in cycles)
-    if reconstructed:
-        novel = [int(r.get("gen_novel", 0)) for r in cycles]
-        dup = [int(r.get("gen_total", 0)) - int(r.get("gen_novel", 0)) for r in cycles]
-        ylabel = "Architectures generated"
-        subtitle = "all generations, structural — comparable across runs"
-    else:
-        novel = [int(r["new_desirable"]) for r in cycles]
-        dup = [int(r["not_novel"]) for r in cycles]
-        ylabel = "Threshold-clearing models"
-        subtitle = "bucketing counts — NOT comparable across run types"
-    rate = [100.0 * n / (n + d) if (n + d) else float("nan")
-            for n, d in zip(novel, dup)]
+    # ── Novelty per cycle: novel vs not-novel counts, as labelled by the pipeline ──
+    # These labels are assigned to every generation regardless of whether it was
+    # evaluated (self-contained skips non-novel; sim-penalty evaluates all) — so the
+    # counts are plotted as recorded; interpretation is left to the reader.
+    novel = [int(r["new_desirable"]) for r in cycles]
+    notnovel = [int(r["not_novel"]) for r in cycles]
     fig, ax = plt.subplots(figsize=(11, 5.5))
-    ax.bar(xs, novel, width=0.6, color="#2ca02c", label="Novel (unique)")
-    ax.bar(xs, dup, width=0.6, bottom=novel, color="#ff7f0e", alpha=0.85,
-           label="Duplicate (non-novel)")
-    ax.set_xlabel("Cycle"); ax.set_ylabel(ylabel)
-    ax.set_title(f"Novel vs Duplicate Architectures per Cycle ({subtitle})")
-    ax.grid(True, alpha=0.3, axis="y")
-    ax2 = ax.twinx()
-    ax2.plot(xs, rate, "o-", color="#1f77b4", label="Novelty rate")
-    ax2.set_ylabel("Novelty rate (%)"); ax2.set_ylim(0, 100)
-    h1, l1 = ax.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, fontsize=9, loc="best")
+    w = 0.4
+    ax.bar([x - w / 2 for x in xs], novel, w, label="Novel", color="#2ca02c")
+    ax.bar([x + w / 2 for x in xs], notnovel, w, label="Not novel", color="#ff7f0e", alpha=0.85)
+    for x, v in zip(xs, novel):
+        ax.text(x - w / 2, v, str(v), ha="center", va="bottom", fontsize=7)
+    for x, v in zip(xs, notnovel):
+        ax.text(x + w / 2, v, str(v), ha="center", va="bottom", fontsize=7)
+    ax.set_title("Novel vs Not-Novel per Cycle")
+    ax.set_xlabel("Cycle"); ax.set_ylabel("Count")
+    ax.grid(True, alpha=0.3, axis="y"); ax.legend(fontsize=10)
     npath = out_dir / "kto_novelty.png"
     fig.tight_layout(); fig.savefig(npath, dpi=130); plt.close(fig)
     paths.append(npath)
@@ -419,9 +321,8 @@ def save_csv(cycles: List[Dict[str, Any]], out_dir: Path) -> Path:
     path = out_dir / "kto_cycle_summary.csv"
     cols = ["cycle", "generated", "evaluated", "valid", "best", "avg", "avg_all",
             "median", "ge_threshold_pct", "new_desirable", "new_undesirable",
-            "low_accuracy", "not_novel", "gen_total", "gen_novel", "novelty_rate",
-            "sim_penalty_nonzero", "sim_penalty_mean", "desirable_total",
-            "undesirable_total", "trained"]
+            "low_accuracy", "not_novel", "novelty_rate", "sim_penalty_nonzero",
+            "sim_penalty_mean", "desirable_total", "undesirable_total", "trained"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
@@ -462,16 +363,6 @@ def main() -> None:
     else:
         print("[plot][warn] no per-model eval_info.json found — 'avg' uses the stored "
               "metric (above-threshold only if produced by the updated pipeline).")
-
-    # Reconstruct per-cycle structural novelty from the generated code files — a
-    # run-type-consistent novelty signal (see compute_generation_novelty).
-    gen_novelty = compute_generation_novelty(cycles_dir)
-    for r in cycles:
-        g = gen_novelty.get(r["cycle"])
-        if g:
-            r["gen_total"] = int(g["total"])
-            r["gen_novel"] = int(g["novel"])
-            r["novelty_rate"] = g["novel"] / g["total"] if g["total"] else float("nan")
 
     figs = plot_separate(cycles, out_dir, run_threshold)
     csv_path = save_csv(cycles, out_dir)
@@ -516,12 +407,6 @@ def main() -> None:
     if above:
         m, lo, hi = mean_t_ci(above)
         print(f"  Average (>= threshold) : {m*100:.2f}%  (95% CI {lo*100:.2f}-{hi*100:.2f}, n={len(above)})")
-    # Run-type-consistent generation novelty (reconstructed from code files).
-    g_novel = sum(int(r.get("gen_novel", 0)) for r in cycles if "gen_total" in r)
-    g_total = sum(int(r.get("gen_total", 0)) for r in cycles if "gen_total" in r)
-    if g_total:
-        print(f"  Generation novelty     : {g_novel}/{g_total} ({100.0 * g_novel / g_total:.1f}%) "
-              "structurally-unique across all generations (run-type-consistent)")
     print(f"  desirable accumulated  : {cycles[-1]['desirable_total']}")
     print("-" * 64)
     for f in figs:
