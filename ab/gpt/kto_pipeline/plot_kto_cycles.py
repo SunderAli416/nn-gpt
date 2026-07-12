@@ -266,7 +266,12 @@ def plot_separate(cycles: List[Dict[str, Any]], out_dir: Path,
                                 (r["pass_acc"], ct_y, ct_lo, ct_hi)):
             p = k / n if n else 0.0
             lo, hi = wilson_ci(k, n)
-            ys.append(p * 100); los.append((p - lo) * 100); his.append((hi - p) * 100)
+            # Clamp error deltas to >= 0: when p == 1.0 (e.g. all models evaluated in
+            # a sim-penalty run) the Wilson bound rounds a hair past p, and matplotlib
+            # rejects negative yerr.
+            ys.append(p * 100)
+            los.append(max(0.0, (p - lo) * 100))
+            his.append(max(0.0, (hi - p) * 100))
 
     paths = [
         acc_path,
