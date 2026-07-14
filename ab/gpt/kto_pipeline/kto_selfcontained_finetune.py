@@ -466,7 +466,43 @@ class SelfContainedKTOPipeline:
         Disabled by eval_skip=False (e.g. benchmark runs that must evaluate ALL),
         and always disabled under the similarity penalty (non-novel passers must be
         evaluated so they can enter training as desirable).
+
+        In nonnovel_undesirable mode the same pre-filter runs off the SimilarityIndex
+        (Jaccard vs LEMUR DB + all prior generations): near-duplicates skip eval too,
+        but they are NOT dropped — bucketing turns them into hard negatives. Every
+        extractable generation joins the reference set so later cycles see it as prior.
         """
+        if self.nonnovel_undesirable and self.sim_index is not None:
+            n = 0
+            for rec in generation_records:
+                if not rec.get("ok"):
+                    continue
+                model_dir = nneval_dir / rec.get("model_id", "")
+                nn_file = model_dir / "new_nn.py"
+                aside = model_dir / "new_nn.notnovel.py"
+                if aside.exists() and not nn_file.exists():
+                    rec["not_novel"] = True  # already filtered on a prior run
+                    n += 1
+                    continue
+                if not nn_file.exists():
+                    continue
+                try:
+                    code = nn_file.read_text(encoding="utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    continue
+                is_dup = self.sim_index.nearest_jaccard(code) >= self.sim_threshold
+                self.sim_index.add(code)  # every generation joins the reference set
+                if is_dup:
+                    rec["not_novel"] = True
+                    try:
+                        nn_file.rename(aside)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    n += 1
+            if n:
+                logger.info(f"[cycle {cycle}] similarity pre-filter: {n} near-duplicate(s) "
+                            "→ undesirable, eval skipped")
+            return n
         if not self.novelty_check or not self.eval_skip or self.sim_index is not None:
             return 0
         n = 0
@@ -574,9 +610,16 @@ class SelfContainedKTOPipeline:
             model_id = rec.get("model_id")
             model_dir = nneval_dir / model_id
 
-            # Duplicate of an already-accepted design — pre-filtered before eval.
+            # Pre-filtered as a duplicate before eval (no GPU spent). In
+            # nonnovel_undesirable mode it becomes a hard negative from its moved-aside
+            # code; otherwise it's dropped (legacy self-contained dedup).
             if rec.get("not_novel"):
                 n_not_novel += 1
+                if self.nonnovel_undesirable:
+                    aside = model_dir / "new_nn.notnovel.py"
+                    if aside.exists():
+                        code = aside.read_text(encoding="utf-8", errors="replace")
+                        add_undesirable(_fenced(code), model_id, "non_novel", None)
                 continue
 
             # ── unparseable generation: salvage raw text as a hard negative ──
@@ -598,18 +641,6 @@ class SelfContainedKTOPipeline:
                 n_skipped += 1
                 continue
             code = code_file.read_text(encoding="utf-8", errors="replace")
-
-            # Novelty gate (nonnovel_undesirable mode): a near-duplicate of a LEMUR DB
-            # model or any earlier generation is a hard negative regardless of accuracy,
-            # pushing the policy away from re-emitting known designs. Every extractable
-            # generation joins the reference set so later cycles see it as "prior".
-            if self.nonnovel_undesirable and self.sim_index is not None:
-                is_dup = self.sim_index.nearest_jaccard(code) >= self.sim_threshold
-                self.sim_index.add(code)
-                if is_dup:
-                    add_undesirable(_fenced(code), model_id, "non_novel", None)
-                    n_not_novel += 1
-                    continue
 
             ev = eval_by_id.get(model_id)
             if ev is None:
@@ -645,8 +676,9 @@ class SelfContainedKTOPipeline:
 
             # passed the accuracy bar.
             if self.nonnovel_undesirable:
-                # Novelty already decided by the Jaccard gate above; a passing model
-                # that reached here is novel → desirable.
+                # Novelty already decided by the similarity pre-filter (near-duplicates
+                # skipped eval and were bucketed undesirable); anything evaluated and
+                # passing here is novel → desirable.
                 n_desirable += 1
                 add_desirable(code, model_id, accuracy)
                 continue
