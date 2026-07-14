@@ -98,6 +98,9 @@ class SelfContainedKTOPipeline:
         sim_shape: str = "exponential",
         sim_db_task: str = "img-classification",
         sim_db_dataset: str = "cifar-10",
+        # Novelty-as-hard-negative: bucket near-duplicates (vs DB + prior gens) as
+        # undesirable, instead of the reward penalty. No reward change applied.
+        nonnovel_undesirable: bool = False,
         # KTO hyperparameters
         kto_beta: float = 0.1,
         kto_desirable_weight: float = 1.0,
@@ -165,6 +168,7 @@ class SelfContainedKTOPipeline:
         self.sim_shape = sim_shape
         self.sim_db_task = sim_db_task
         self.sim_db_dataset = sim_db_dataset
+        self.nonnovel_undesirable = nonnovel_undesirable
 
         self.kto_beta = kto_beta
         self.kto_desirable_weight = kto_desirable_weight
@@ -214,18 +218,24 @@ class SelfContainedKTOPipeline:
         # Novelty checker — starts EMPTY (no dataset); grows as we accept models.
         self.novelty_checker = NoveltyChecker(self.output_dir / "seen_models.json")
 
-        # Similarity-penalty index (#3): LEMUR DB code + our own prior generations.
-        # Built once; new generations are added as they're accepted (cumulative).
+        # Similarity index: LEMUR DB code + our own prior generations. Shared by two
+        # (mutually exclusive) modes — the reward penalty (sim_penalty) scores against
+        # accepted generations only; the novelty-as-hard-negative mode
+        # (nonnovel_undesirable) scores against ALL prior generations (desirable +
+        # undesirable) so near-duplicates get bucketed as undesirable, no reward change.
         self.sim_index = None
-        if self.sim_penalty:
+        if self.sim_penalty or self.nonnovel_undesirable:
             from ab.gpt.kto_pipeline.similarity_penalty import SimilarityIndex
             self.sim_index = SimilarityIndex(threshold=self.sim_threshold)
             n_db = self.sim_index.add_db(self.sim_db_task, self.sim_db_dataset)
-            n_prev = self.sim_index.add_codes(
-                [_unfenced(r.get("completion", "")) for r in self.desirable])
+            prior = [_unfenced(r.get("completion", "")) for r in self.desirable]
+            if self.nonnovel_undesirable:
+                prior += [_unfenced(r.get("completion", "")) for r in self.undesirable]
+            n_prev = self.sim_index.add_codes(prior)
+            mode = ("nonnovel->undesirable" if self.nonnovel_undesirable
+                    else f"reward-penalty alpha={self.sim_alpha} shape={self.sim_shape}")
             logger.info(f"[sim] index built: {n_db} DB models + {n_prev} prior generations "
-                        f"(alpha={self.sim_alpha}, threshold={self.sim_threshold}, "
-                        f"shape={self.sim_shape})")
+                        f"(mode={mode}, threshold={self.sim_threshold})")
 
         self._setup_logging()
         self.cycle_results: List[Dict[str, Any]] = []
@@ -522,7 +532,9 @@ class SelfContainedKTOPipeline:
 
         def add_desirable(code: str, model_id: str, accuracy: float) -> None:
             pen = 0.0
-            if self.sim_index is not None:
+            # Reward-penalty mode only: score + index here. In nonnovel_undesirable
+            # mode the bucketing gate already indexed every generation.
+            if self.sim_penalty and self.sim_index is not None:
                 pen = self.sim_index.penalty_for(code, self.sim_shape)  # vs DB + prior gens
                 self.sim_index.add(code)                                # becomes a "prior" too
                 cycle_penalties.append(pen)
@@ -587,6 +599,18 @@ class SelfContainedKTOPipeline:
                 continue
             code = code_file.read_text(encoding="utf-8", errors="replace")
 
+            # Novelty gate (nonnovel_undesirable mode): a near-duplicate of a LEMUR DB
+            # model or any earlier generation is a hard negative regardless of accuracy,
+            # pushing the policy away from re-emitting known designs. Every extractable
+            # generation joins the reference set so later cycles see it as "prior".
+            if self.nonnovel_undesirable and self.sim_index is not None:
+                is_dup = self.sim_index.nearest_jaccard(code) >= self.sim_threshold
+                self.sim_index.add(code)
+                if is_dup:
+                    add_undesirable(_fenced(code), model_id, "non_novel", None)
+                    n_not_novel += 1
+                    continue
+
             ev = eval_by_id.get(model_id)
             if ev is None:
                 # Generated + extractable but evaluator never returned a verdict
@@ -619,11 +643,18 @@ class SelfContainedKTOPipeline:
                 n_und_lowacc += 1
                 continue
 
-            # passed the accuracy bar. Without the similarity penalty, exact
-            # duplicates of already-accepted designs are skipped (legacy dedup).
-            # WITH the similarity penalty (sim_index set), non-novel passers are
-            # NOT skipped — they enter as desirable carrying a penalty; novelty
-            # stays a reported metric only.
+            # passed the accuracy bar.
+            if self.nonnovel_undesirable:
+                # Novelty already decided by the Jaccard gate above; a passing model
+                # that reached here is novel → desirable.
+                n_desirable += 1
+                add_desirable(code, model_id, accuracy)
+                continue
+            # Legacy / reward-penalty modes: structural novelty decides desirability.
+            # Without the similarity penalty, exact duplicates of already-accepted
+            # designs are skipped (legacy dedup). WITH the penalty (sim_index set),
+            # non-novel passers enter as desirable carrying a penalty; novelty stays
+            # a reported metric only.
             is_novel = self.novelty_checker.is_novel(code, model_id) if self.novelty_check else True
             if is_novel:
                 n_desirable += 1
@@ -641,6 +672,10 @@ class SelfContainedKTOPipeline:
 
         n_und_total = (n_und_compile + n_und_runtime + n_und_lowacc
                        + n_und_unparseable)
+        # In nonnovel_undesirable mode the non-novel generations were bucketed as
+        # hard negatives, so count them in the undesirable totals.
+        if self.nonnovel_undesirable:
+            n_und_total += n_not_novel
         best_acc = max(accuracies) if accuracies else 0.0
         # Card-style avg: mean over models that cleared the threshold. Keep the
         # all-valid mean as a secondary field.
@@ -656,6 +691,7 @@ class SelfContainedKTOPipeline:
                 "runtime_error": n_und_runtime,
                 "low_accuracy": n_und_lowacc,
                 "unparseable": n_und_unparseable,
+                "non_novel": n_not_novel if self.nonnovel_undesirable else 0,
             },
             "not_novel_skipped": n_not_novel,
             "sim_penalty_mean": (sum(cycle_penalties) / len(cycle_penalties)) if cycle_penalties else 0.0,
@@ -677,7 +713,10 @@ class SelfContainedKTOPipeline:
         logger.info(f"      runtime error        : {n_und_runtime}")
         logger.info(f"      low accuracy         : {n_und_lowacc}")
         logger.info(f"      unparseable          : {n_und_unparseable}")
-        logger.info(f"  ~ not novel (skipped)    : {n_not_novel}")
+        if self.nonnovel_undesirable:
+            logger.info(f"      non-novel (dup)      : {n_not_novel}")
+        else:
+            logger.info(f"  ~ not novel (skipped)    : {n_not_novel}")
         logger.info(f"  skipped (no signal)      : {n_skipped}")
         logger.info(f"  best / avg(>=thr) / avg(all): {best_acc*100:.2f}% / "
                     f"{avg_acc*100:.2f}% / {avg_acc_all*100:.2f}%")
@@ -941,6 +980,13 @@ def main() -> None:
     parser.add_argument("--sim_db_task", type=str, default="img-classification")
     parser.add_argument("--sim_db_dataset", type=str, default="cifar-10")
 
+    # novelty-as-hard-negative (alternative to the reward penalty): bucket
+    # near-duplicates (vs LEMUR DB + ALL prior gens) as undesirable, no reward change.
+    parser.add_argument("--nonnovel_undesirable", action="store_true", default=False,
+                        help="Bucket near-duplicate architectures (Jaccard >= --sim_threshold vs "
+                             "LEMUR DB + all prior generations) as UNDESIRABLE, alongside "
+                             "non-compiling/low-accuracy. No reward penalty is applied.")
+
     parser.add_argument("--kto_beta", type=float, default=0.1)
     parser.add_argument("--kto_desirable_weight", type=float, default=1.0)
     parser.add_argument("--kto_undesirable_weight", type=float, default=1.0)
@@ -1001,6 +1047,7 @@ def main() -> None:
         sim_shape=args.sim_shape,
         sim_db_task=args.sim_db_task,
         sim_db_dataset=args.sim_db_dataset,
+        nonnovel_undesirable=args.nonnovel_undesirable,
         kto_beta=args.kto_beta,
         kto_desirable_weight=args.kto_desirable_weight,
         kto_undesirable_weight=args.kto_undesirable_weight,
