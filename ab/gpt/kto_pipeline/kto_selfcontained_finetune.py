@@ -98,9 +98,17 @@ class SelfContainedKTOPipeline:
         sim_shape: str = "exponential",
         sim_db_task: str = "img-classification",
         sim_db_dataset: str = "cifar-10",
-        # Novelty-as-hard-negative: bucket near-duplicates (vs DB + prior gens) as
-        # undesirable, instead of the reward penalty. No reward change applied.
+        # Check novelty via similarity vs LEMUR DB + ALL prior generations (Jaccard),
+        # instead of the structural-hash-vs-accepted-gens default. On its own, non-novel
+        # models are DISCARDED (like the baseline); with nonnovel_undesirable they
+        # become hard negatives instead. No reward change either way.
+        novelty_db: bool = False,
+        # Bucket near-duplicates (vs DB + prior gens) as undesirable (implies novelty_db).
         nonnovel_undesirable: bool = False,
+        # Train on every undesirable example (skip the undesirable_ratio cap; still
+        # capped by max_undesirable_total) — pair with class_weight_mode=auto to
+        # rebalance an imbalanced desirable:undesirable split by weight, not subsampling.
+        use_all_undesirable: bool = False,
         # KTO hyperparameters
         kto_beta: float = 0.1,
         kto_desirable_weight: float = 1.0,
@@ -168,7 +176,12 @@ class SelfContainedKTOPipeline:
         self.sim_shape = sim_shape
         self.sim_db_task = sim_db_task
         self.sim_db_dataset = sim_db_dataset
+        self.novelty_db = novelty_db
         self.nonnovel_undesirable = nonnovel_undesirable
+        # nonnovel_undesirable implies DB-similarity novelty; both go through the
+        # SimilarityIndex pre-filter (skip eval of near-duplicates).
+        self.use_db_novelty = novelty_db or nonnovel_undesirable
+        self.use_all_undesirable = use_all_undesirable
 
         self.kto_beta = kto_beta
         self.kto_desirable_weight = kto_desirable_weight
@@ -224,16 +237,22 @@ class SelfContainedKTOPipeline:
         # (nonnovel_undesirable) scores against ALL prior generations (desirable +
         # undesirable) so near-duplicates get bucketed as undesirable, no reward change.
         self.sim_index = None
-        if self.sim_penalty or self.nonnovel_undesirable:
+        if self.sim_penalty or self.use_db_novelty:
             from ab.gpt.kto_pipeline.similarity_penalty import SimilarityIndex
             self.sim_index = SimilarityIndex(threshold=self.sim_threshold)
             n_db = self.sim_index.add_db(self.sim_db_task, self.sim_db_dataset)
             prior = [_unfenced(r.get("completion", "")) for r in self.desirable]
-            if self.nonnovel_undesirable:
+            if self.use_db_novelty:
+                # DB-novelty compares against ALL prior generations, so seed from the
+                # undesirable cache too (reward-penalty mode scores vs accepted only).
                 prior += [_unfenced(r.get("completion", "")) for r in self.undesirable]
             n_prev = self.sim_index.add_codes(prior)
-            mode = ("nonnovel->undesirable" if self.nonnovel_undesirable
-                    else f"reward-penalty alpha={self.sim_alpha} shape={self.sim_shape}")
+            if self.sim_penalty:
+                mode = f"reward-penalty alpha={self.sim_alpha} shape={self.sim_shape}"
+            elif self.nonnovel_undesirable:
+                mode = "db-novelty; non-novel -> undesirable"
+            else:
+                mode = "db-novelty; non-novel -> discarded"
             logger.info(f"[sim] index built: {n_db} DB models + {n_prev} prior generations "
                         f"(mode={mode}, threshold={self.sim_threshold})")
 
@@ -467,12 +486,13 @@ class SelfContainedKTOPipeline:
         and always disabled under the similarity penalty (non-novel passers must be
         evaluated so they can enter training as desirable).
 
-        In nonnovel_undesirable mode the same pre-filter runs off the SimilarityIndex
-        (Jaccard vs LEMUR DB + all prior generations): near-duplicates skip eval too,
-        but they are NOT dropped — bucketing turns them into hard negatives. Every
-        extractable generation joins the reference set so later cycles see it as prior.
+        Under DB-similarity novelty (novelty_db / nonnovel_undesirable) the same
+        pre-filter runs off the SimilarityIndex (Jaccard vs LEMUR DB + all prior
+        generations): near-duplicates skip eval either way. They are then DISCARDED
+        (novelty_db) or turned into hard negatives (nonnovel_undesirable) in bucketing.
+        Every extractable generation joins the reference set so later cycles see it.
         """
-        if self.nonnovel_undesirable and self.sim_index is not None:
+        if self.use_db_novelty and self.sim_index is not None:
             n = 0
             for rec in generation_records:
                 if not rec.get("ok"):
@@ -675,10 +695,10 @@ class SelfContainedKTOPipeline:
                 continue
 
             # passed the accuracy bar.
-            if self.nonnovel_undesirable:
+            if self.use_db_novelty:
                 # Novelty already decided by the similarity pre-filter (near-duplicates
-                # skipped eval and were bucketed undesirable); anything evaluated and
-                # passing here is novel → desirable.
+                # skipped eval, then discarded or bucketed undesirable); anything
+                # evaluated and passing here is novel → desirable.
                 n_desirable += 1
                 add_desirable(code, model_id, accuracy)
                 continue
@@ -769,9 +789,14 @@ class SelfContainedKTOPipeline:
         Ua = len(undesirables)
 
         # Cap undesirables to keep KTO balanced; keep the most-recent (sharper)
-        # negatives.  Also respect the absolute total cap.
-        max_u = math.floor(D * self.undesirable_ratio) if D > 0 else Ua
-        max_u = min(max_u, self.max_undesirable_total)
+        # negatives.  Also respect the absolute total cap. use_all_undesirable skips
+        # the desirable-relative ratio cap (rebalance by class weight instead), but
+        # still respects max_undesirable_total as a memory/speed ceiling.
+        if self.use_all_undesirable:
+            max_u = min(Ua, self.max_undesirable_total)
+        else:
+            max_u = math.floor(D * self.undesirable_ratio) if D > 0 else Ua
+            max_u = min(max_u, self.max_undesirable_total)
         if Ua > max_u and max_u >= 0:
             selected_u = undesirables[-max_u:] if max_u > 0 else []
         else:
@@ -1012,12 +1037,20 @@ def main() -> None:
     parser.add_argument("--sim_db_task", type=str, default="img-classification")
     parser.add_argument("--sim_db_dataset", type=str, default="cifar-10")
 
-    # novelty-as-hard-negative (alternative to the reward penalty): bucket
-    # near-duplicates (vs LEMUR DB + ALL prior gens) as undesirable, no reward change.
+    # DB-similarity novelty (vs the structural-hash-vs-accepted default): check
+    # novelty by Jaccard >= --sim_threshold vs LEMUR DB + ALL prior generations.
+    parser.add_argument("--novelty_db", action="store_true", default=False,
+                        help="Decide novelty by similarity to the LEMUR DB + all prior "
+                             "generations; non-novel are DISCARDED (eval skipped). No reward change.")
+    # ...and, instead of discarding, bucket near-duplicates as UNDESIRABLE (implies --novelty_db).
     parser.add_argument("--nonnovel_undesirable", action="store_true", default=False,
-                        help="Bucket near-duplicate architectures (Jaccard >= --sim_threshold vs "
-                             "LEMUR DB + all prior generations) as UNDESIRABLE, alongside "
-                             "non-compiling/low-accuracy. No reward penalty is applied.")
+                        help="Like --novelty_db but bucket near-duplicates as UNDESIRABLE (hard "
+                             "negatives) alongside non-compiling/low-accuracy, instead of discarding.")
+    # imbalance handling: use every undesirable (skip the 1:1-style ratio cap) and
+    # rebalance by class weight — pair with --class_weight_mode auto.
+    parser.add_argument("--use_all_undesirable", action="store_true", default=False,
+                        help="Train on all undesirable examples (skip the --undesirable_ratio cap; "
+                             "still capped by --max_undesirable_total). Use with --class_weight_mode auto.")
 
     parser.add_argument("--kto_beta", type=float, default=0.1)
     parser.add_argument("--kto_desirable_weight", type=float, default=1.0)
@@ -1079,7 +1112,9 @@ def main() -> None:
         sim_shape=args.sim_shape,
         sim_db_task=args.sim_db_task,
         sim_db_dataset=args.sim_db_dataset,
+        novelty_db=args.novelty_db,
         nonnovel_undesirable=args.nonnovel_undesirable,
+        use_all_undesirable=args.use_all_undesirable,
         kto_beta=args.kto_beta,
         kto_desirable_weight=args.kto_desirable_weight,
         kto_undesirable_weight=args.kto_undesirable_weight,
