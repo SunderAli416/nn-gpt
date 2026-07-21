@@ -109,6 +109,12 @@ class SelfContainedKTOPipeline:
         # capped by max_undesirable_total) — pair with class_weight_mode=auto to
         # rebalance an imbalanced desirable:undesirable split by weight, not subsampling.
         use_all_undesirable: bool = False,
+        # Accuracy-scaled reward: weight each desirable example's KTO loss by a factor
+        # that grows continuously with its eval accuracy above the threshold (higher
+        # accuracy → stronger reward). No effect on undesirable examples.
+        graded_reward: bool = False,
+        graded_scale: float = 2.0,
+        graded_shape: str = "linear",
         # KTO hyperparameters
         kto_beta: float = 0.1,
         kto_desirable_weight: float = 1.0,
@@ -182,6 +188,9 @@ class SelfContainedKTOPipeline:
         # SimilarityIndex pre-filter (skip eval of near-duplicates).
         self.use_db_novelty = novelty_db or nonnovel_undesirable
         self.use_all_undesirable = use_all_undesirable
+        self.graded_reward = graded_reward
+        self.graded_scale = graded_scale
+        self.graded_shape = graded_shape
 
         self.kto_beta = kto_beta
         self.kto_desirable_weight = kto_desirable_weight
@@ -344,6 +353,20 @@ class SelfContainedKTOPipeline:
         if self.threshold_mode == "linear":
             return min(floor + self.threshold_slope * max(0, cycle - 1), self.threshold_ceil)
         return floor
+
+    def _grade_weight(self, accuracy: Optional[float]) -> float:
+        """Accuracy-scaled desirable weight in [1, 1+graded_scale]. 1.0 at the
+        threshold, rising continuously with accuracy (linear ramp, or exponential
+        to emphasise near-ceiling models). 1.0 when graded_reward is off."""
+        if not self.graded_reward:
+            return 1.0
+        thr = self.accuracy_threshold
+        t = (float(accuracy or 0.0) - thr) / max(1e-6, 1.0 - thr)
+        t = max(0.0, min(1.0, t))
+        if self.graded_shape == "exponential":
+            gamma = 4.0
+            t = (math.exp(gamma * t) - 1.0) / (math.exp(gamma) - 1.0)
+        return 1.0 + self.graded_scale * t
 
     def _class_weights(self, ds_stats: Dict[str, Any]) -> Tuple[float, float]:
         """KTO imbalance rule: balance desirable_weight*n_D vs undesirable_weight*n_U."""
@@ -805,11 +828,13 @@ class SelfContainedKTOPipeline:
         combined = [
             {"prompt_messages": r["prompt_messages"], "completion": r["completion"],
              "label": True, "sim_penalty": float(r.get("sim_penalty", 0.0)),
+             "grade_weight": self._grade_weight(r.get("_meta", {}).get("accuracy")),
              "_meta": r.get("_meta", {})}
             for r in desirables
         ] + [
             {"prompt_messages": r["prompt_messages"], "completion": r["completion"],
-             "label": False, "sim_penalty": 0.0, "_meta": r.get("_meta", {})}
+             "label": False, "sim_penalty": 0.0, "grade_weight": 1.0,
+             "_meta": r.get("_meta", {})}
             for r in selected_u
         ]
         _write_jsonl(combined, kto_file)
@@ -876,6 +901,8 @@ class SelfContainedKTOPipeline:
         ]
         if self.sim_penalty:
             cmd.extend(["--sim_alpha", str(self.sim_alpha)])
+        if self.graded_reward:
+            cmd.append("--graded_reward")
         if prev_adapter is not None:
             logger.info(f"[cycle {cycle}] warm-starting from previous adapter: {prev_adapter}")
             cmd.extend(["--peft", str(prev_adapter)])
@@ -1051,6 +1078,15 @@ def main() -> None:
     parser.add_argument("--use_all_undesirable", action="store_true", default=False,
                         help="Train on all undesirable examples (skip the --undesirable_ratio cap; "
                              "still capped by --max_undesirable_total). Use with --class_weight_mode auto.")
+    # accuracy-scaled reward: weight desirable examples by eval accuracy (>= threshold).
+    parser.add_argument("--graded_reward", action="store_true", default=False,
+                        help="Scale each desirable example's KTO loss by an accuracy-derived weight "
+                             "(higher accuracy → stronger reward); continuous, not hardcoded thresholds.")
+    parser.add_argument("--graded_scale", type=float, default=2.0,
+                        help="Max extra desirable weight at accuracy=1.0 (weight in [1, 1+scale]).")
+    parser.add_argument("--graded_shape", type=str, default="linear",
+                        choices=["linear", "exponential"],
+                        help="How the weight ramps with accuracy above threshold.")
 
     parser.add_argument("--kto_beta", type=float, default=0.1)
     parser.add_argument("--kto_desirable_weight", type=float, default=1.0)
@@ -1115,6 +1151,9 @@ def main() -> None:
         novelty_db=args.novelty_db,
         nonnovel_undesirable=args.nonnovel_undesirable,
         use_all_undesirable=args.use_all_undesirable,
+        graded_reward=args.graded_reward,
+        graded_scale=args.graded_scale,
+        graded_shape=args.graded_shape,
         kto_beta=args.kto_beta,
         kto_desirable_weight=args.kto_desirable_weight,
         kto_undesirable_weight=args.kto_undesirable_weight,
