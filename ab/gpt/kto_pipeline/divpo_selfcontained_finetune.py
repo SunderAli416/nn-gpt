@@ -323,6 +323,17 @@ class SelfContainedDivPOPipeline(SelfContainedKTOPipeline):
         return {"success": True, "checkpoint_dir": str(checkpoint_dir),
                 "training_time_minutes": minutes, "dpo_beta": self.dpo_beta}
 
+    def _prev_adapter(self, cycle: int) -> Optional[Path]:
+        """Warm-start from the most recent VALID checkpoint (one that actually has
+        adapter_config.json), walking back past any cycle whose DPO training failed
+        and left an empty checkpoint dir. Without this, one failed cycle cascades:
+        the next cycle's generation is handed a non-existent adapter and dies too."""
+        for c in range(cycle - 1, 0, -1):
+            ckpt = self._checkpoint_dir(c)
+            if (ckpt / "adapter_config.json").exists():
+                return ckpt
+        return None
+
     # ── orchestration (mirrors base run_cycle; swaps the two DivPO stages) ──────
 
     def run_cycle(self, cycle: int) -> Dict[str, Any]:

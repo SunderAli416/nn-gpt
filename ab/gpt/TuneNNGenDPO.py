@@ -19,6 +19,12 @@ plain DPO.
 
 from __future__ import annotations
 
+import os
+# DPO runs forward passes for BOTH chosen and rejected (plus the reference model),
+# so peak GPU memory is ~2-4x KTO's. Reduce the allocator's fragmentation (the OOM
+# error explicitly recommends this) BEFORE torch initialises the CUDA allocator.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import json
 import sys
@@ -41,8 +47,11 @@ LLM_CONF = "nngpt_unique_arch_rag.json"
 NUM_TRAIN_EPOCHS = 5
 LR_SCHEDULER = "cosine"
 MAX_GRAD_NORM = 1.0
-PER_DEVICE_TRAIN_BATCH_SIZE = 2
-GRADIENT_ACCUMULATION_STEPS = 4
+# DPO's paired forward (chosen+rejected+reference) makes batch 2 OOM on 48GB with
+# 4096-token architecture code; batch 1 halves peak memory. grad-accum doubled so
+# the effective batch (8) still matches KTO. DPO needs no batch>1 (per-pair loss).
+PER_DEVICE_TRAIN_BATCH_SIZE = 1
+GRADIENT_ACCUMULATION_STEPS = 8
 WARMUP_RATIO = 0.05
 LOGGING_STEPS = 10
 LEARNING_RATE = 1e-5
