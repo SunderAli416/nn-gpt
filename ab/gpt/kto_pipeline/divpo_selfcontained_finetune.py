@@ -59,6 +59,12 @@ class SelfContainedDivPOPipeline(SelfContainedKTOPipeline):
         dpo_beta: float = 0.1,
         divpo_neg_per_pos: int = 3,
         divpo_max_pairs: int = 1000,
+        graph_gate: bool = False,
+        graph_gate_granularity: str = "topology",
+        graph_gate_sizes: str = "32,64,96,224,256",
+        graph_gate_wl_rounds: int = 3,
+        graph_gate_num_classes: int = 10,
+        graph_gate_in_channels: int = 3,
         **base_kwargs,
     ):
         # DivPO needs the DB-similarity novelty pre-filter (skip eval of near-dupes,
@@ -70,6 +76,22 @@ class SelfContainedDivPOPipeline(SelfContainedKTOPipeline):
         self.dpo_beta = float(dpo_beta)
         self.divpo_neg_per_pos = max(1, int(divpo_neg_per_pos))
         self.divpo_max_pairs = int(divpo_max_pairs)
+
+        # Graph-canonicalization novelty gate (opt-in; default off keeps every prior
+        # run byte-identical and resume-safe — _prefilter_novelty falls straight
+        # through to super()). When on, an architecture is novel only if it is
+        # Jaccard-novel AND its canonical graph (torch.fx make_fx + Weisfeiler-Lehman
+        # hash) has not been generated before, closing the lexical over-count.
+        self.graph_gate = bool(graph_gate)
+        self.graph_gate_granularity = graph_gate_granularity
+        self.graph_gate_sizes = [int(s) for s in str(graph_gate_sizes).split(",") if s.strip()]
+        self.graph_gate_wl_rounds = int(graph_gate_wl_rounds)
+        self.graph_gate_num_classes = int(graph_gate_num_classes)
+        self.graph_gate_in_channels = int(graph_gate_in_channels)
+        self._graph_seen_records: List[Dict[str, Any]] = []
+        if self.graph_gate:
+            self._graph_seen_file = self.output_dir / "divpo_graph_seen.jsonl"
+            self._graph_seen_records = _read_jsonl(self._graph_seen_file)
 
         # Preference-pair cache — accumulates across cycles like the KTO caches.
         self.divpo_pairs_cache_file = self.output_dir / "divpo_pairs_cache.jsonl"
@@ -101,6 +123,9 @@ class SelfContainedDivPOPipeline(SelfContainedKTOPipeline):
         logger.info(f"  novelty threshold  : Jaccard >= {self.sim_threshold} = non-novel")
         logger.info(f"  quality floor      : accuracy >= {self.accuracy_threshold}")
         logger.info(f"  starting pairs     : {len(self.divpo_pairs)}")
+        if self.graph_gate:
+            logger.info(f"  graph gate         : ON (granularity={self.graph_gate_granularity}, "
+                        f"sizes={self.graph_gate_sizes}, {len(self._graph_seen_records)} hashes loaded)")
         logger.info("=" * 80)
 
     def _load_db_codes(self) -> None:
@@ -334,6 +359,92 @@ class SelfContainedDivPOPipeline(SelfContainedKTOPipeline):
                 return ckpt
         return None
 
+    # ── stage 2b': novelty pre-filter + optional graph-canonicalization gate ────
+
+    def _prefilter_novelty(self, cycle: int, nneval_dir: Path,
+                           generation_records: List[Dict[str, Any]]) -> int:
+        """With the graph gate off this is the inherited Jaccard-only pre-filter
+        (byte-identical → existing runs resume untouched). With it on, an
+        architecture is additionally flagged non-novel when its canonical graph
+        (make_fx aten trace + WL hash) duplicates one generated in an earlier cycle
+        — catching the structural duplicates Jaccard misses. Trace failures fail
+        open (Jaccard-only). Seen hashes persist per-cycle so a mid-run resume never
+        re-traces the whole history nor sees a future cycle's structures."""
+        if not self.graph_gate or self.sim_index is None:
+            return super()._prefilter_novelty(cycle, nneval_dir, generation_records)
+
+        from ab.gpt.kto_pipeline.graph_novelty_audit import graph_hash_for_file
+
+        def _hash(path: Path) -> Optional[str]:
+            h, _ = graph_hash_for_file(
+                path, self.graph_gate_sizes, self.graph_gate_in_channels,
+                self.graph_gate_num_classes, "aten",
+                self.graph_gate_granularity, self.graph_gate_wl_rounds)
+            return h
+
+        # Idempotency across resumes (mirrors build_divpo_dataset): forget this
+        # cycle's and any later cycle's persisted hashes; they are recomputed here.
+        self._graph_seen_records = [r for r in self._graph_seen_records
+                                    if int(r.get("cycle", -1)) < cycle]
+        seen = {r["h"] for r in self._graph_seen_records}
+
+        def _remember(h: Optional[str]) -> bool:
+            if h is None:
+                return False
+            was = h in seen
+            if not was:
+                seen.add(h)
+                self._graph_seen_records.append({"cycle": cycle, "h": h})
+            return was
+
+        n = n_graph_only = n_traced = n_tracefail = 0
+        for rec in generation_records:
+            if not rec.get("ok"):
+                continue
+            model_dir = nneval_dir / rec.get("model_id", "")
+            nn_file = model_dir / "new_nn.py"
+            aside = model_dir / "new_nn.notnovel.py"
+
+            # Already flagged on a prior run: keep the flag but re-register its graph
+            # so later cycles still dedup against this structure.
+            if aside.exists() and not nn_file.exists():
+                rec["not_novel"] = True
+                _remember(_hash(aside))
+                n += 1
+                continue
+            if not nn_file.exists():
+                continue
+            try:
+                code = nn_file.read_text(encoding="utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                continue
+
+            jaccard_dup = self.sim_index.nearest_jaccard(code) >= self.sim_threshold
+            self.sim_index.add(code)  # every generation joins the reference set
+
+            h = _hash(nn_file)
+            if h is None:
+                n_tracefail += 1
+            else:
+                n_traced += 1
+            graph_dup = _remember(h)  # True iff this graph was seen earlier
+
+            if jaccard_dup or graph_dup:
+                rec["not_novel"] = True
+                if graph_dup and not jaccard_dup:
+                    n_graph_only += 1
+                try:
+                    nn_file.rename(aside)
+                except Exception:  # noqa: BLE001
+                    pass
+                n += 1
+
+        _write_jsonl(self._graph_seen_records, self._graph_seen_file)
+        logger.info(f"[cycle {cycle}] graph-gate pre-filter: {n} non-novel "
+                    f"({n_graph_only} caught by graph beyond Jaccard) · "
+                    f"traced {n_traced} ok / {n_tracefail} fail → eval skipped")
+        return n
+
     # ── orchestration (mirrors base run_cycle; swaps the two DivPO stages) ──────
 
     def run_cycle(self, cycle: int) -> Dict[str, Any]:
@@ -404,6 +515,16 @@ def main() -> None:
                    help="Rejected examples sampled per chosen (augment sparse positives)")
     p.add_argument("--divpo_max_pairs", type=int, default=1000,
                    help="Cap on accumulated pairs used per DPO training (most recent kept)")
+
+    # Graph-canonicalization novelty gate (opt-in; default off = Jaccard-only).
+    p.add_argument("--graph_gate", action="store_true",
+                   help="Also flag graph-isomorphic duplicates as non-novel "
+                        "(make_fx aten trace + Weisfeiler-Lehman hash vs prior cycles)")
+    p.add_argument("--graph_gate_granularity", choices=["topology", "typed"], default="topology")
+    p.add_argument("--graph_gate_sizes", type=str, default="32,64,96,224,256")
+    p.add_argument("--graph_gate_wl_rounds", type=int, default=3)
+    p.add_argument("--graph_gate_num_classes", type=int, default=10)
+    p.add_argument("--graph_gate_in_channels", type=int, default=3)
     args = p.parse_args()
 
     pipeline = SelfContainedDivPOPipeline(
@@ -411,6 +532,12 @@ def main() -> None:
         dpo_beta=args.dpo_beta,
         divpo_neg_per_pos=args.divpo_neg_per_pos,
         divpo_max_pairs=args.divpo_max_pairs,
+        graph_gate=args.graph_gate,
+        graph_gate_granularity=args.graph_gate_granularity,
+        graph_gate_sizes=args.graph_gate_sizes,
+        graph_gate_wl_rounds=args.graph_gate_wl_rounds,
+        graph_gate_num_classes=args.graph_gate_num_classes,
+        graph_gate_in_channels=args.graph_gate_in_channels,
         # inherited baseline params
         llm_conf=args.llm_conf,
         cycles=args.cycles,

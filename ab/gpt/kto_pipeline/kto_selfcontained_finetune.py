@@ -115,6 +115,17 @@ class SelfContainedKTOPipeline:
         graded_reward: bool = False,
         graded_scale: float = 2.0,
         graded_shape: str = "linear",
+        # Graph-canonicalization novelty gate (opt-in). When on, an architecture is
+        # novel only if Jaccard-novel AND its canonical graph (torch.fx make_fx aten
+        # trace + Weisfeiler-Lehman hash) was not generated in an earlier cycle. Default
+        # off → the Jaccard-only novelty path is byte-identical, so existing runs and
+        # resumes are unaffected.
+        graph_gate: bool = False,
+        graph_gate_granularity: str = "topology",
+        graph_gate_sizes: str = "32,64,96,224,256",
+        graph_gate_wl_rounds: int = 3,
+        graph_gate_num_classes: int = 10,
+        graph_gate_in_channels: int = 3,
         # KTO hyperparameters
         kto_beta: float = 0.1,
         kto_desirable_weight: float = 1.0,
@@ -236,6 +247,19 @@ class SelfContainedKTOPipeline:
         self.undesirable_cache_file = self.output_dir / "kto_undesirable_cache.jsonl"
         self.desirable: List[Dict[str, Any]] = _read_jsonl(self.desirable_cache_file)
         self.undesirable: List[Dict[str, Any]] = _read_jsonl(self.undesirable_cache_file)
+
+        # Graph-canonicalization novelty gate state (off by default; the seen-hash
+        # file is loaded only when enabled so non-gate runs create no extra files).
+        self.graph_gate = bool(graph_gate)
+        self.graph_gate_granularity = graph_gate_granularity
+        self.graph_gate_sizes = [int(s) for s in str(graph_gate_sizes).split(",") if s.strip()]
+        self.graph_gate_wl_rounds = int(graph_gate_wl_rounds)
+        self.graph_gate_num_classes = int(graph_gate_num_classes)
+        self.graph_gate_in_channels = int(graph_gate_in_channels)
+        self._graph_seen_records: List[Dict[str, Any]] = []
+        if self.graph_gate:
+            self._graph_seen_file = self.output_dir / "graph_gate_seen.jsonl"
+            self._graph_seen_records = _read_jsonl(self._graph_seen_file)
 
         # Novelty checker — starts EMPTY (no dataset); grows as we accept models.
         self.novelty_checker = NoveltyChecker(self.output_dir / "seen_models.json")
@@ -516,7 +540,31 @@ class SelfContainedKTOPipeline:
         Every extractable generation joins the reference set so later cycles see it.
         """
         if self.use_db_novelty and self.sim_index is not None:
-            n = 0
+            gate = self.graph_gate
+            if gate:
+                # Structural gate: also flag graph-isomorphic duplicates Jaccard misses
+                # (make_fx aten trace + WL hash vs earlier cycles). Fail-open on
+                # untraceable archs. Seen hashes persist per-cycle; drop >= this cycle
+                # so a mid-run resume never re-traces history nor sees future structures.
+                from ab.gpt.kto_pipeline.graph_novelty_audit import graph_hash_for_file
+                self._graph_seen_records = [r for r in self._graph_seen_records
+                                            if int(r.get("cycle", -1)) < cycle]
+                seen = {r["h"] for r in self._graph_seen_records}
+
+                def _remember(path: Path) -> bool:
+                    h, _ = graph_hash_for_file(
+                        path, self.graph_gate_sizes, self.graph_gate_in_channels,
+                        self.graph_gate_num_classes, "aten",
+                        self.graph_gate_granularity, self.graph_gate_wl_rounds)
+                    if h is None:
+                        return False
+                    was = h in seen
+                    if not was:
+                        seen.add(h)
+                        self._graph_seen_records.append({"cycle": cycle, "h": h})
+                    return was
+
+            n = n_graph_only = 0
             for rec in generation_records:
                 if not rec.get("ok"):
                     continue
@@ -525,6 +573,8 @@ class SelfContainedKTOPipeline:
                 aside = model_dir / "new_nn.notnovel.py"
                 if aside.exists() and not nn_file.exists():
                     rec["not_novel"] = True  # already filtered on a prior run
+                    if gate:
+                        _remember(aside)  # re-register its graph for later cycles
                     n += 1
                     continue
                 if not nn_file.exists():
@@ -535,6 +585,11 @@ class SelfContainedKTOPipeline:
                     continue
                 is_dup = self.sim_index.nearest_jaccard(code) >= self.sim_threshold
                 self.sim_index.add(code)  # every generation joins the reference set
+                if gate:
+                    graph_dup = _remember(nn_file)  # True iff this graph was seen earlier
+                    if graph_dup and not is_dup:
+                        n_graph_only += 1
+                    is_dup = is_dup or graph_dup
                 if is_dup:
                     rec["not_novel"] = True
                     try:
@@ -542,9 +597,12 @@ class SelfContainedKTOPipeline:
                     except Exception:  # noqa: BLE001
                         pass
                     n += 1
+            if gate:
+                _write_jsonl(self._graph_seen_records, self._graph_seen_file)
             if n:
-                logger.info(f"[cycle {cycle}] similarity pre-filter: {n} near-duplicate(s) "
-                            "→ undesirable, eval skipped")
+                extra = f" ({n_graph_only} by graph beyond Jaccard)" if gate else ""
+                logger.info(f"[cycle {cycle}] similarity pre-filter: {n} near-duplicate(s)"
+                            f"{extra} → undesirable, eval skipped")
             return n
         if not self.novelty_check or not self.eval_skip or self.sim_index is not None:
             return 0
@@ -1119,6 +1177,16 @@ def main() -> None:
     parser.add_argument("--params_limit", type=int, default=500_000)
     parser.add_argument("--save_to_db", action="store_true", default=False)
 
+    # Graph-canonicalization novelty gate (opt-in; default off = Jaccard-only).
+    parser.add_argument("--graph_gate", action="store_true",
+                        help="Also flag graph-isomorphic duplicates as non-novel "
+                             "(make_fx aten trace + Weisfeiler-Lehman hash vs prior cycles)")
+    parser.add_argument("--graph_gate_granularity", choices=["topology", "typed"], default="topology")
+    parser.add_argument("--graph_gate_sizes", type=str, default="32,64,96,224,256")
+    parser.add_argument("--graph_gate_wl_rounds", type=int, default=3)
+    parser.add_argument("--graph_gate_num_classes", type=int, default=10)
+    parser.add_argument("--graph_gate_in_channels", type=int, default=3)
+
     parser.add_argument("--output_subdir", type=str, default="kto_selfcontained")
     parser.add_argument("--resume_from_cycle", type=int, default=None)
     parser.add_argument("--max_retries", type=int, default=2)
@@ -1154,6 +1222,12 @@ def main() -> None:
         graded_reward=args.graded_reward,
         graded_scale=args.graded_scale,
         graded_shape=args.graded_shape,
+        graph_gate=args.graph_gate,
+        graph_gate_granularity=args.graph_gate_granularity,
+        graph_gate_sizes=args.graph_gate_sizes,
+        graph_gate_wl_rounds=args.graph_gate_wl_rounds,
+        graph_gate_num_classes=args.graph_gate_num_classes,
+        graph_gate_in_channels=args.graph_gate_in_channels,
         kto_beta=args.kto_beta,
         kto_desirable_weight=args.kto_desirable_weight,
         kto_undesirable_weight=args.kto_undesirable_weight,
