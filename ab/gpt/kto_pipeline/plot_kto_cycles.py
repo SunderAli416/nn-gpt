@@ -79,6 +79,28 @@ def load_cycles(results_path: Path, cycles_dir: Optional[Path]) -> List[Dict[str
     return [by_cycle[k] for k in sorted(by_cycle)]
 
 
+def present_cycles(cycles_dir: Optional[Path]) -> List[int]:
+    """Cycle numbers whose FOLDER exists on disk (ground truth, not metrics), sorted.
+    A genuinely-missing folder in between is simply absent → the renumbering below
+    collapses the gap."""
+    nums: List[int] = []
+    if cycles_dir and cycles_dir.exists():
+        for p in cycles_dir.glob("cycle_*"):
+            s = p.name.split("_")
+            if p.is_dir() and len(s) > 1 and s[1].isdigit():
+                nums.append(int(s[1]))
+    return sorted(nums)
+
+
+def renumber_map(cycles_dir: Optional[Path], max_cycle: int) -> Dict[int, int]:
+    """{original_cycle -> contiguous 1..N} over present folders, capped to the first
+    max_cycle present ones (0 = no cap). Missing folders collapse the numbering."""
+    present = present_cycles(cycles_dir)
+    if max_cycle and max_cycle > 0:
+        present = present[:max_cycle]
+    return {orig: i + 1 for i, orig in enumerate(present)}
+
+
 def wilson_ci(k: int, n: int, z: float = 1.96):
     """95% Wilson score interval for a proportion k/n → (lo, hi) in [0, 1]."""
     if n <= 0:
@@ -343,6 +365,9 @@ def main() -> None:
     p.add_argument("--out_dir", type=str, default="kto_plots")
     p.add_argument("--cycles_dir", type=str, default=None,
                    help="Optional dir with cycle_<n>/metrics.json for full history (default: results dir)")
+    p.add_argument("--max_cycle", type=int, default=0,
+                   help="Plot only the first N present cycles (0 = all). Missing cycle "
+                        "folders are collapsed and cycles renumbered contiguously.")
     args = p.parse_args()
 
     results_path = Path(args.results)
@@ -354,6 +379,14 @@ def main() -> None:
     # metrics.json persist across resumes and give the full history.
     cycles_dir = Path(args.cycles_dir) if args.cycles_dir else results_path.parent
     cycles = load_cycles(results_path, cycles_dir)
+    # Renumber by FOLDER presence (collapse genuinely-missing cycles) and cap; keep only
+    # cycles whose folder exists, remap their number to the contiguous 1..N sequence.
+    rmap = renumber_map(cycles_dir, args.max_cycle)
+    cycles = [r for r in cycles if r["cycle"] in rmap]
+    for r in cycles:
+        r["orig_cycle"] = r["cycle"]
+        r["cycle"] = rmap[r["cycle"]]
+    cycles.sort(key=lambda r: r["cycle"])
     if not cycles:
         raise SystemExit("No cycles with metrics found in the results file.")
 
@@ -363,6 +396,7 @@ def main() -> None:
     except Exception:  # noqa: BLE001
         run_threshold = 0.40
     per_model = load_per_model_accuracies(cycles_dir)
+    per_model = {rmap[c]: v for c, v in per_model.items() if c in rmap}  # renumbered
     if per_model:
         apply_pass_average(cycles, per_model, run_threshold)
     else:
@@ -391,8 +425,15 @@ def main() -> None:
         checked = uniq + dup
         uniq_str = (f" · Unique: {uniq}/{checked} ({100.0 * uniq / checked:.1f}%)"
                     if checked else "")
+        # Mean accuracy over the ABOVE-threshold models (distinct from the ≥thr RATE
+        # below) + its t-based 95% CI, saved into the card so the report can read it.
+        am, alo, ahi = mean_t_ci(above)
+        above_str = (f" · Average (≥{run_threshold*100:.0f}%): {am*100:.2f}% "
+                     f"[95% CI {alo*100:.2f}-{ahi*100:.2f}] (n={len(above)})"
+                     if above else "")
         card = (f"Valid: {n_valid}/{denom} ({100.0 * n_valid / denom:.1f}%) · "
-                f"Average (all valid): {m*100:.2f}% [95% CI {lo*100:.2f}-{hi*100:.2f}] · "
+                f"Average (all valid): {m*100:.2f}% [95% CI {lo*100:.2f}-{hi*100:.2f}]"
+                + above_str + " · "
                 f"Median: {_median(all_valid)*100:.2f}% · "
                 f"Best: {max(all_valid)*100:.2f}% · "
                 f"≥{run_threshold*100:.0f}%: {ge:.2f}%" + uniq_str)

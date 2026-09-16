@@ -503,6 +503,9 @@ def main() -> None:
     p.add_argument("--eval_lr", type=float, default=0.01)
     p.add_argument("--eval_momentum", type=float, default=0.9)
     p.add_argument("--eval_batch", type=int, default=10)
+    p.add_argument("--eval_multi_gpu", action="store_true",
+                   help="Distribute evaluation across all visible GPUs (NNEval worker pool); "
+                        "pins generation/training to one GPU. Needs >1 GPU allocated.")
     p.add_argument("--output_subdir", type=str, default="divpo_selfcontained")
     p.add_argument("--resume_from_cycle", type=int, default=None)
 
@@ -556,6 +559,7 @@ def main() -> None:
         eval_lr=args.eval_lr,
         eval_momentum=args.eval_momentum,
         eval_batch=args.eval_batch,
+        eval_multi_gpu=args.eval_multi_gpu,
         output_subdir=args.output_subdir,
         resume_from_cycle=args.resume_from_cycle,
     )

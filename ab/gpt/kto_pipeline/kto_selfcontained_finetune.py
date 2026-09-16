@@ -157,6 +157,11 @@ class SelfContainedKTOPipeline:
         eval_batch: int = 10,
         eval_dropout: float = 0.2,
         eval_train_epochs: int = 1,
+        # Multi-GPU evaluation (opt-in). When on, evaluation is distributed across
+        # ALL visible GPUs via NNEval's worker pool, and generation/training are pinned
+        # to a single GPU so they stay identical to a 1-GPU run. Default off → eval is
+        # sequential on one GPU and nothing about existing runs changes.
+        eval_multi_gpu: bool = False,
         params_limit: int = 500_000,
         save_to_db: bool = False,
         # plumbing
@@ -231,6 +236,7 @@ class SelfContainedKTOPipeline:
         self.eval_batch = eval_batch
         self.eval_dropout = eval_dropout
         self.eval_train_epochs = eval_train_epochs
+        self.eval_multi_gpu = bool(eval_multi_gpu)
         self.params_limit = params_limit
         self.save_to_db = save_to_db
 
@@ -502,8 +508,10 @@ class SelfContainedKTOPipeline:
                 transform=self.eval_transform,
                 custom_synth_dir=str(nneval_dir),
                 cycle=cycle,
-                use_sequential=True,
-                use_all_visible_gpus=False,
+                # Multi-GPU: distribute eval across all visible GPUs via NNEval's
+                # worker pool (dynamic, one worker per GPU). Off → old single-GPU path.
+                use_sequential=not self.eval_multi_gpu,
+                use_all_visible_gpus=self.eval_multi_gpu,
             )
         except Exception as e:  # noqa: BLE001
             logger.error(f"[cycle {cycle}] NNEval raised: {type(e).__name__}: {e}")
@@ -1063,6 +1071,13 @@ class SelfContainedKTOPipeline:
         # and exits before training starts.  Harmless for the generator subprocess.
         env = os.environ.copy()
         env["MKL_THREADING_LAYER"] = "GNU"
+        # Multi-GPU eval keeps generation/training single-GPU: pin these subprocesses
+        # to the first VISIBLE GPU (whatever index the scheduler allocated, not a
+        # hardcoded 0) so device_map="auto" can't shard the 7B model across both — only
+        # NNEval's in-process eval pool uses every visible GPU.
+        if self.eval_multi_gpu:
+            env["CUDA_VISIBLE_DEVICES"] = (
+                env.get("CUDA_VISIBLE_DEVICES", "") or "0").split(",")[0]
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             result = subprocess.run(cmd, capture_output=False, text=True, check=False, env=env)
@@ -1174,6 +1189,9 @@ def main() -> None:
                         help="Card/ab.nn protocol = 10")
     parser.add_argument("--eval_dropout", type=float, default=0.2)
     parser.add_argument("--eval_train_epochs", type=int, default=1)
+    parser.add_argument("--eval_multi_gpu", action="store_true",
+                        help="Distribute evaluation across all visible GPUs (NNEval worker "
+                             "pool); pins generation/training to one GPU. Needs >1 GPU allocated.")
     parser.add_argument("--params_limit", type=int, default=500_000)
     parser.add_argument("--save_to_db", action="store_true", default=False)
 
@@ -1249,6 +1267,7 @@ def main() -> None:
         eval_batch=args.eval_batch,
         eval_dropout=args.eval_dropout,
         eval_train_epochs=args.eval_train_epochs,
+        eval_multi_gpu=args.eval_multi_gpu,
         params_limit=args.params_limit,
         save_to_db=args.save_to_db,
         output_subdir=args.output_subdir,
