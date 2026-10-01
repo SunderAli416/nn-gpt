@@ -33,9 +33,15 @@ def true_max_acc(gen_dir: Path) -> float | None:
     if not info.exists():
         return None
     try:
-        res = json.loads(info.read_text(encoding="utf-8")).get("eval_results")
+        payload = json.loads(info.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return None
+    # ab.nn records the best accuracy over the schedule as prm.best_accuracy;
+    # eval_results.accuracy is only the final epoch.
+    prm = (payload.get("eval_args") or {}).get("prm") or {}
+    if prm.get("best_accuracy") is not None:
+        return float(prm["best_accuracy"]) * 100.0
+    res = payload.get("eval_results")
     if isinstance(res, dict):
         eps = res.get("epochs") or []
         accs = [e.get("accuracy", e.get("acc")) for e in eps if isinstance(e, dict)]

@@ -38,6 +38,14 @@ def _acc(payload: dict) -> Optional[float]:
 
 
 def _max_acc(payload: dict) -> Optional[float]:
+    """Best accuracy over the training schedule. ab.nn records it as prm.best_accuracy;
+    eval_results.accuracy is only the FINAL epoch, so it is the last resort."""
+    prm = (payload.get("eval_args") or {}).get("prm") or {}
+    if prm.get("best_accuracy") is not None:
+        try:
+            return float(prm["best_accuracy"])
+        except (TypeError, ValueError):
+            pass
     res = payload.get("eval_results")
     if isinstance(res, dict):
         eps = res.get("epochs") or []
