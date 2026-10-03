@@ -149,12 +149,15 @@ def main() -> None:
     cfg = dict(sizes=[int(s) for s in args.sizes.split(",") if s.strip()], in_ch=args.in_ch,
                n_cls=args.n_cls, granularity=args.granularity, wl_rounds=args.wl_rounds,
                timeout=args.timeout)
-    meta = {k: cfg[k] for k in ("sizes", "in_ch", "n_cls", "granularity", "wl_rounds")}
-    meta.update(task=args.task, dataset=args.dataset)
+    settings = {k: cfg[k] for k in ("sizes", "in_ch", "n_cls", "granularity", "wl_rounds")}
+    settings.update(task=args.task, dataset=args.dataset)
     meta_file = out.with_name(out.name + ".meta.json")
-    if meta_file.exists() and json.loads(meta_file.read_text(encoding="utf-8")) != meta:
-        raise SystemExit(f"{out} was built with different settings ({meta_file}); use a new --out")
-    meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    if meta_file.exists():
+        old = json.loads(meta_file.read_text(encoding="utf-8"))
+        if {k: old.get(k) for k in settings} != settings:
+            raise SystemExit(f"{out} was built with different settings ({meta_file}); use a new --out")
+    # "complete" stays False until the end, so runs refuse a partially built corpus.
+    meta_file.write_text(json.dumps({**settings, "complete": False}, indent=2), encoding="utf-8")
     progress = {"n": 0, "ok": 0}
     with open(out, "a", encoding="utf-8") as fh:
         def _write(rec):
@@ -175,6 +178,8 @@ def main() -> None:
             if rec.get("h"):
                 traced += 1
                 hashes.add(rec["h"])
+    meta_file.write_text(json.dumps({**settings, "complete": True, "entries": total, "traced": traced,
+                                     "distinct_structures": len(hashes)}, indent=2), encoding="utf-8")
     print(f"done: {total} entries, {traced} traced ({100 * traced / max(1, total):.1f}%), "
           f"{len(hashes)} distinct WL structures -> {out}", flush=True)
 

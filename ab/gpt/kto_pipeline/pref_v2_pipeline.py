@@ -136,6 +136,9 @@ class PrefV2Pipeline(SelfContainedKTOPipeline):
             logger.warning(f"[v2] no {meta_file.name}; cannot verify corpus tracing settings")
             return
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        if not meta.get("complete", True):
+            raise RuntimeError(f"structural corpus {corpus} is incomplete: wait for the corpus job "
+                               "to finish, or resubmit it to continue")
         want = {k: self.trace_cfg[k] for k in ("sizes", "in_ch", "n_cls", "granularity", "wl_rounds")}
         want["dataset"] = self.sim_db_dataset
         diff = {k: (meta.get(k), v) for k, v in want.items() if meta.get(k) != v}
