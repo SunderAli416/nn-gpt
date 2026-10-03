@@ -42,7 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ab.gpt.kto_pipeline.build_struct_corpus import trace_many
 from ab.gpt.kto_pipeline.kto_generator import build_prompt_messages
 from ab.gpt.kto_pipeline.kto_selfcontained_finetune import (
-    SelfContainedKTOPipeline, _fenced, _read_jsonl, _write_jsonl, logger, save_cycle_results,
+    SelfContainedKTOPipeline, _fenced, _read_jsonl, logger,
 )
 from ab.gpt.kto_pipeline.structural_archive import StructuralArchive
 
@@ -59,6 +59,23 @@ def _code_key(code: str) -> str:
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Temp file + rename: a job killed mid-write never leaves a truncated state file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _write_jsonl(records: List[Dict[str, Any]], path: Path) -> None:
+    _atomic_write(path, "".join(json.dumps(r) + "\n" for r in records))
+
+
+def _write_json(obj: Dict[str, Any], path: Path) -> None:
+    _atomic_write(path, json.dumps(obj, indent=2, default=str))
 
 
 class PrefV2Pipeline(SelfContainedKTOPipeline):
@@ -222,7 +239,9 @@ class PrefV2Pipeline(SelfContainedKTOPipeline):
 
     def _first_incomplete_cycle(self) -> int:
         for c in range(1, self.cycles + 1):
-            if not (self.output_dir / f"cycle_{c}" / "metrics.json").exists():
+            try:
+                json.loads((self.output_dir / f"cycle_{c}" / "metrics.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
                 return c
         return self.cycles + 1
 
@@ -264,9 +283,11 @@ class PrefV2Pipeline(SelfContainedKTOPipeline):
         cycles = []
         for c in range(1, self.cycles + 1):
             f = self.output_dir / f"cycle_{c}" / "metrics.json"
-            if f.exists():
+            try:
                 cycles.append(json.loads(f.read_text(encoding="utf-8")))
-        save_cycle_results({"base_model": self.base_model, "accuracy_threshold": self.accuracy_threshold,
+            except (OSError, ValueError):
+                continue
+        _write_json({"base_model": self.base_model, "accuracy_threshold": self.accuracy_threshold,
                             "rule": self.rule, "selection": self.selection,
                             "struct_archive": self.struct_archive, "anchors": self.n_anchors,
                             "beta": self.beta, "cycles": cycles},
@@ -308,9 +329,9 @@ class PrefV2Pipeline(SelfContainedKTOPipeline):
 
     def generate_models(self, cycle: int) -> Tuple[Path, List[Dict[str, Any]]]:
         gpus = self._visible_gpus()
-        shards = min(self.gen_shards, max(1, len(gpus)), self.models_per_cycle)
-        if shards <= 1:
+        if not gpus:
             return super().generate_models(cycle)
+        shards = min(self.gen_shards, len(gpus), self.models_per_cycle)
         cdir = self._cycle_dir(cycle)
         nneval_dir, records_file = cdir / "nneval", cdir / "generation_records.jsonl"
         if records_file.exists() and nneval_dir.exists():
@@ -651,7 +672,7 @@ class PrefV2Pipeline(SelfContainedKTOPipeline):
             "bucketing": sel_stats, "dataset": ds_stats, "training": train_stats,
             "cycle_time_minutes": (time.time() - t0) / 60,
         }
-        save_cycle_results(result, self._cycle_dir(cycle) / "metrics.json")
+        _write_json(result, self._cycle_dir(cycle) / "metrics.json")   # written last: marks the generation done
         return result
 
 
