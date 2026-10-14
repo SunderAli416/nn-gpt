@@ -12,7 +12,7 @@ Generation g:
      already-archived WL hash a structural duplicate (filters only with
      --struct_archive, always logged), rarity = 1 - max WL-kernel cosine to the
      archive; duplicates skip evaluation;
-  3. evaluate the rest (1 epoch CIFAR-10); good = non-duplicate with acc >= tau;
+  3. evaluate the rest (1 epoch on --dataset); good = non-duplicate with acc >= tau;
   4. select. binary: chosen = good, rejected = every other candidate. graded:
      chosen = good candidates with rarity >= the generation's median over good,
      rejected = every other candidate except non-duplicate bad ones rarer than
@@ -20,6 +20,8 @@ Generation g:
   5. sample N (chosen, rejected) pairs uniformly from the last W generations, both
      sides under the same prompt. DPO trains on the N pairs, KTO on their 2N
      unpaired sides, SFT on the N chosen sides, with equal steps per epoch.
+The "frozen" rule skips step 5: every generation samples the untrained model
+(the sampling baseline the trained loop is compared against).
 """
 from __future__ import annotations
 
@@ -46,7 +48,7 @@ from ab.gpt.kto_pipeline.kto_selfcontained_finetune import (
 )
 from ab.gpt.kto_pipeline.structural_archive import StructuralArchive
 
-RULES = ("dpo", "kto", "sft")
+RULES = ("dpo", "kto", "sft", "frozen")
 SELECTIONS = ("binary", "graded")
 # (per-device batch, grad accumulation): 8 pairs = 16 unpaired = 8 chosen per step,
 # so every rule takes the same number of optimizer steps on the same N pairs.
@@ -129,8 +131,10 @@ class PrefV2Pipeline(SelfContainedKTOPipeline):
         logger.info("=" * 80)
         logger.info(f"PIPELINE v2  rule={rule}  selection={selection}  struct_archive={self.struct_archive}  "
                     f"anchors={self.n_anchors}  beta={self.beta}")
-        logger.info(f"  buffer: window {self.window} generations, {self.pairs_per_gen} pairs/generation; "
-                    f"batch {BATCH[rule][0]}x{BATCH[rule][1]}; continual adapter, reference = frozen base")
+        train_desc = (f"batch {BATCH[rule][0]}x{BATCH[rule][1]}; continual adapter, reference = frozen base"
+                      if rule in BATCH else "no training (frozen generator)")
+        logger.info(f"  dataset {self.dataset} (LEMUR {self.sim_db_dataset}), threshold {self.accuracy_threshold}; "
+                    f"buffer: window {self.window} generations, {self.pairs_per_gen} pairs/generation; {train_desc}")
         logger.info(f"  archive: {self.archive.n_items} LEMUR structures ({len(self.lemur_hashes)} distinct hashes); "
                     f"lexical index {self.sim_index.size}; prompt mode {self.prompt_mode}")
         if self.n_anchors:
@@ -203,7 +207,8 @@ class PrefV2Pipeline(SelfContainedKTOPipeline):
             "rule": self.rule, "selection": self.selection, "struct_archive": self.struct_archive,
             "anchors_per_generation": self.n_anchors, "anchor_pool": len(self.anchor_codes),
             "window": self.window, "pairs_per_generation": self.pairs_per_gen, "beta": self.beta,
-            "batch": BATCH[self.rule], "learning_rate": self.kto_learning_rate, "lora_r": self.kto_lora_r,
+            "dataset": self.dataset, "lemur_dataset": self.sim_db_dataset,
+            "batch": BATCH.get(self.rule), "learning_rate": self.kto_learning_rate, "lora_r": self.kto_lora_r,
             "lora_alpha": self.kto_lora_alpha, "max_grad_norm": self.kto_max_grad_norm,
             "epochs": self.num_train_epochs, "max_prompt_length": self.kto_max_prompt_length,
             "max_completion_length": self.kto_max_completion_length,
@@ -337,6 +342,8 @@ class PrefV2Pipeline(SelfContainedKTOPipeline):
         if records_file.exists() and nneval_dir.exists():
             logger.info(f"[cycle {cycle}] Reusing existing generations: {records_file}")
             return nneval_dir, _read_jsonl(records_file)
+        if shards > 1:
+            self._ensure_local_model(gpus[0])
         adapter = self._prev_adapter(cycle)
         logger.info(f"CYCLE {cycle}: GENERATION ({self.models_per_cycle} models, {shards} GPUs)  adapter={adapter}")
         per = math.ceil(self.models_per_cycle / shards)
@@ -351,6 +358,22 @@ class PrefV2Pipeline(SelfContainedKTOPipeline):
         _write_jsonl(records, records_file)
         logger.info(f"[cycle {cycle}] generation done: {sum(1 for r in records if r.get('ok'))}/{len(records)} extractable")
         return nneval_dir, records
+
+    def _ensure_local_model(self, gpu: str) -> None:
+        """The first load of a new base model saves a local copy (ab.gpt.util.LLM); do that in
+        one process so parallel generator shards never write the copy concurrently."""
+        from ab.gpt.util.Const import llm_dir, llm_tokenizer_dir
+        from ab.nn.util.Const import out_dir
+        if (llm_dir(out_dir, self.base_model) / "config.json").exists() \
+                and llm_tokenizer_dir(out_dir, self.base_model).exists():
+            return
+        logger.info(f"[v2] first use of {self.base_model}: creating its local copy before parallel generation")
+        env = os.environ.copy()
+        env["MKL_THREADING_LAYER"] = "GNU"
+        env["CUDA_VISIBLE_DEVICES"] = gpu
+        code = ("from ab.gpt.util.LLM import LLM; from ab.gpt.util.LLMUtil import quantization_config_4bit; "
+                f"LLM({self.base_model!r}, quantization_config_4bit, context_length={self.context_length})")
+        subprocess.run([sys.executable, "-c", code], env=env, check=True)
 
     def _run_parallel(self, jobs: List[Tuple[List[str], Path, str]], name: str) -> None:
         pending = list(range(len(jobs)))
@@ -657,9 +680,13 @@ class PrefV2Pipeline(SelfContainedKTOPipeline):
         eval_by_id = self.evaluate_models(cycle, nneval_dir)
         self._free_gpu()
         sel_stats = self._select(cycle, nneval_dir, records, eval_by_id)
-        data_file, ds_stats = self._build_training_data(cycle)
-        train_stats = (self._train(cycle, data_file) if data_file is not None
-                       else {"success": False, "skipped": True, "reason": "insufficient_pairs"})
+        if self.rule == "frozen":
+            ds_stats = {"rule": "frozen"}
+            train_stats = {"success": False, "skipped": True, "reason": "frozen"}
+        else:
+            data_file, ds_stats = self._build_training_data(cycle)
+            train_stats = (self._train(cycle, data_file) if data_file is not None
+                           else {"success": False, "skipped": True, "reason": "insufficient_pairs"})
         if train_stats.get("success") or train_stats.get("skipped"):
             self._train_failures = 0
         else:
@@ -697,6 +724,7 @@ def main() -> None:
     p.add_argument("--wl_rounds", type=int, default=3)
 
     p.add_argument("--llm_conf", default="nngpt_unique_arch_rag.json")
+    p.add_argument("--dataset", default="cifar-10", help="Benchmark: prompt, evaluation and tracing")
     p.add_argument("--cycles", type=int, default=25)
     p.add_argument("--models_per_cycle", type=int, default=100)
     p.add_argument("--accuracy_threshold", type=float, default=0.40)
@@ -708,7 +736,7 @@ def main() -> None:
     p.add_argument("--gen_max_rejections", type=int, default=3)
     p.add_argument("--sim_threshold", type=float, default=0.85)
     p.add_argument("--sim_db_task", default="img-classification")
-    p.add_argument("--sim_db_dataset", default="cifar-10")
+    p.add_argument("--sim_db_dataset", default=None, help="LEMUR subset (default: --dataset)")
     p.add_argument("--eval_transform", default="norm_256_flip")
     p.add_argument("--eval_lr", type=float, default=0.01)
     p.add_argument("--eval_momentum", type=float, default=0.9)
@@ -727,11 +755,11 @@ def main() -> None:
         anchor_params_limit=a.anchor_params_limit, gen_shards=a.gen_shards,
         trace_workers=a.trace_workers, trace_timeout=a.trace_timeout, graph_sizes=a.graph_sizes,
         graph_granularity=a.graph_granularity, wl_rounds=a.wl_rounds,
-        llm_conf=a.llm_conf, cycles=a.cycles, models_per_cycle=a.models_per_cycle,
+        llm_conf=a.llm_conf, dataset=a.dataset, cycles=a.cycles, models_per_cycle=a.models_per_cycle,
         accuracy_threshold=a.accuracy_threshold, num_train_epochs=a.num_train_epochs,
         temperature=a.temperature, top_k=a.top_k, top_p=a.top_p, max_new_tokens=a.max_new_tokens,
         gen_max_rejections=a.gen_max_rejections, sim_threshold=a.sim_threshold,
-        sim_db_task=a.sim_db_task, sim_db_dataset=a.sim_db_dataset,
+        sim_db_task=a.sim_db_task, sim_db_dataset=a.sim_db_dataset or a.dataset,
         eval_transform=a.eval_transform, eval_lr=a.eval_lr, eval_momentum=a.eval_momentum,
         eval_batch=a.eval_batch, eval_dropout=a.eval_dropout, eval_multi_gpu=a.eval_multi_gpu,
         output_subdir=a.output_subdir, resume_from_cycle=a.resume_from_cycle, seed=a.seed,
